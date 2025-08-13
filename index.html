@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8" />
+<title>13×15 Map Viewer (Web Bluetooth)</title>
+<style>
+     :root {
+        --cell: 26px;
+        --rows: 13;
+        --cols: 15;
+    }
+    
+    body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        background: #f9f9f9;
+        font-family: system-ui, sans-serif;
+    }
+    /* 버튼 + 범례 묶음 */
+    
+    #controls {
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    
+    .legend span {
+        display: inline-block;
+        width: 16px;
+        height: 16px;
+        border-radius: 3px;
+        vertical-align: middle;
+        margin-right: 6px;
+    }
+    /* 맵 컨테이너 */
+    
+    #map-container {
+        flex: 1;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin: 20px 0;
+    }
+    /* 맵 박스: 비율 유지 + 화면에 맞게, 너무 넓지 않게 */
+    
+    #map-wrap {
+        position: relative;
+        /* 가로폭을 뷰포트 폭과 높이 예산 중 작은 값으로 제한 */
+        width: min(90vw, calc((100vh - 260px) * (var(--cols) / var(--rows))));
+        aspect-ratio: var(--cols) / var(--rows);
+        /* 15 / 13 */
+        overflow: visible;
+        /* 잘리지 않게 */
+    }
+    /* 배경 이미지: 절대 안 잘리게 contain, 클릭은 통과 */
+    
+    #bgImg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        /* 전체 보이기 */
+        z-index: 0;
+        pointer-events: none;
+        /* 클릭은 그리드가 받음 */
+    }
+    /* 그리드: 이미지 위로 덮기 */
+    
+    #grid {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        grid-template-rows: repeat(var(--rows), 1fr);
+        grid-template-columns: repeat(var(--cols), 1fr);
+        gap: 2px;
+        background: transparent;
+        z-index: 1;
+        /* 이미지 위 */
+        pointer-events: auto;
+    }
+    /* 셀 스타일 */
+    
+    .cell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        border-radius: 4px;
+        background: rgba(238, 238, 238, 0);
+        color: #333;
+        user-select: none;
+        cursor: pointer;
+    }
+    
+    .wall {
+        background: #333;
+        color: #fff;
+        opacity: 0;
+    }
+    /* 벽을 투명 처리(지도 보이게) */
+    
+    .path {
+        background: #ffd54d;
+        color: #333;
+    }
+    /* 4 */
+    
+    .pos {
+        background: #4ea1ff;
+        color: #fff;
+        font-weight: 700;
+    }
+    /* 2 */
+    
+    .goal {
+        background: #ff5b5b;
+        color: #fff;
+        font-weight: 700;
+    }
+    /* 3 */
+    /* 상태 줄 */
+    
+    #info {
+        margin-top: 6px;
+        font-size: 14px;
+    }
+    /* 로그 영역 */
+    
+    #log {
+        width: 100%;
+        height: 10px;
+        overflow: auto;
+        background: #111;
+        color: #ddd;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        padding: 8px;
+        border-radius: 8px;
+        white-space: pre-wrap;
+    }
+    
+    button {
+        padding: 8px 14px;
+        font-size: 14px;
+        margin-right: 6px;
+    }
+</style>
+
+<body>
+    <h1>13×15 Map Viewer (Web Bluetooth)</h1>
+    <div id="controls">
+        <div>
+            <button id="btn">Connect</button>
+            <button id="startBtn" disabled>Start (send '1')</button>
+            <span id="status">disconnected</span>
+        </div>
+        <div class="legend" style="margin-top:8px;">
+            <span style="background:#ffd54d;"></span>4 경로 &nbsp;
+            <span style="background:#4ea1ff;"></span>2 현재 &nbsp;
+            <span style="background:#ff5b5b;"></span>3 목적지
+        </div>
+        <div id="info">
+            <b>POS:</b> <span id="pos">(-,-)</span> &nbsp; | &nbsp;
+            <b>GOAL:</b> <span id="goal">(-,-)</span>
+        </div>
+        <!-- 맵 -->
+        <div id="map-container">
+            <div id="map-wrap">
+                <img id="bgImg" src="map_bg.png" alt="지도 이미지">
+                <div id="grid"></div>
+            </div>
+        </div>
+
+        <!-- 로그 -->
+        <div id="log"></div>
+
+        <script>
+            /* ===== BLE constants ===== */
+            const UART_SERVICE = 0xFFE0;
+            const CANDIDATE_CHARS = [0xFFE1, 0xFFE2];
+            const CANDIDATE_SHORTS = CANDIDATE_CHARS.map(x => '0000' + x.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb');
+
+            /* ===== DOM ===== */
+            const logEl = document.getElementById('log');
+            const statusEl = document.getElementById('status');
+            const posEl = document.getElementById('pos');
+            const goalEl = document.getElementById('goal');
+            const gridEl = document.getElementById('grid');
+            const startBtn = document.getElementById('startBtn');
+
+            /* ===== Map state ===== */
+            let rows = 13,
+                cols = 15;
+            let car = {
+                r: -1,
+                c: -1
+            };
+            let goal = {
+                r: -1,
+                c: -1
+            };
+            const walls = new Set(); // "r,c"
+            const path = new Set(); // "r,c"
+
+            /* ===== BLE state ===== */
+            let device = null,
+                gatt = null,
+                uartSvc = null;
+            let rxChar = null,
+                txChar = null;
+            let notifyActive = false;
+
+            /* ===== UI helpers ===== */
+            function key(r, c) {
+                return `${r},${c}`;
+            }
+
+            function renderGrid() {
+                gridEl.style.setProperty('--rows', rows);
+                gridEl.style.setProperty('--cols', cols);
+                gridEl.innerHTML = '';
+
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < cols; c++) {
+                        const k = key(r, c);
+                        let cls = 'cell',
+                            label = '';
+
+                        if (walls.has(k)) {
+                            cls += ' wall';
+                            label = '1';
+                        }
+                        if (path.has(k)) {
+                            cls += ' path';
+                            label = '4';
+                        }
+
+                        if (goal.r === r && goal.c === c) {
+                            cls += ' goal';
+                            label = '3';
+                        }
+                        if (car.r === r && car.c === c) {
+                            cls += ' pos';
+                            label = '2';
+                        }
+
+                        const div = document.createElement('div');
+                        div.className = cls;
+                        div.textContent = label;
+                        div.dataset.r = r;
+                        div.dataset.c = c;
+
+                        // 클릭 → SETGOAL 전송 (벽도 클릭은 가능하되, 펌웨어에서 검증)
+                        div.onclick = async() => {
+                            const rr = parseInt(div.dataset.r, 10),
+                                cc = parseInt(div.dataset.c, 10);
+                            // 로컬 즉시 반영
+                            goal = {
+                                r: rr,
+                                c: cc
+                            };
+                            goalEl.textContent = `(${rr},${cc})`;
+                            renderGrid();
+
+                            if (txChar) {
+                                try {
+                                    await bleWriteLine(`SETGOAL,${rr},${cc}`);
+                                    log('TX:', `SETGOAL,${rr},${cc}`);
+                                } catch (e) {
+                                    log('Write failed:', e.message || e);
+                                }
+                            } else {
+                                log('Not connected; goal set locally only.');
+                            }
+                        };
+
+                        gridEl.appendChild(div);
+                    }
+                }
+            }
+
+            function log(...args) {
+                logEl.textContent += args.join(' ') + '\n';
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+
+            function setStatus(s) {
+                statusEl.textContent = s;
+            }
+
+            /* ===== Parser ===== */
+            function parseLine(line) {
+                const parts = line.trim().split(',');
+                if (!parts.length) return;
+                const tag = parts[0].toUpperCase();
+
+                if (tag === 'POS' && parts.length >= 3) {
+                    const r = parseInt(parts[1], 10),
+                        c = parseInt(parts[2], 10);
+                    if (Number.isInteger(r) && Number.isInteger(c)) {
+                        car = {
+                            r,
+                            c
+                        };
+                        posEl.textContent = `(${r},${c})`;
+                        renderGrid();
+                    }
+                } else if (tag === 'GOAL' && parts.length >= 3) {
+                    const r = parseInt(parts[1], 10),
+                        c = parseInt(parts[2], 10);
+                    if (Number.isInteger(r) && Number.isInteger(c)) {
+                        goal = {
+                            r,
+                            c
+                        };
+                        goalEl.textContent = `(${r},${c})`;
+                        renderGrid();
+                    }
+                } else if (tag === 'HELLO' && parts.length >= 3) {
+                    const r = parseInt(parts[1], 10),
+                        c = parseInt(parts[2], 10);
+                    if (Number.isInteger(r) && Number.isInteger(c)) {
+                        rows = r;
+                        cols = c;
+                        walls.clear();
+                        path.clear();
+                        car = {
+                            r: -1,
+                            c: -1
+                        };
+                        goal = {
+                            r: -1,
+                            c: -1
+                        };
+                        renderGrid();
+                        log('Grid resized to', rows, 'x', cols);
+                    }
+                } else if ((tag === 'WALL' || tag === 'BLOCK') && parts.length >= 3) {
+                    const r = parseInt(parts[1], 10),
+                        c = parseInt(parts[2], 10);
+                    if (Number.isInteger(r) && Number.isInteger(c)) {
+                        walls.add(key(r, c));
+                        path.delete(key(r, c));
+                        renderGrid();
+                    }
+                } else if (tag === 'CLEARPATH') {
+                    path.clear();
+                    renderGrid();
+                } else if (tag === 'PATH' && parts.length >= 3) {
+                    const r = parseInt(parts[1], 10),
+                        c = parseInt(parts[2], 10);
+                    if (Number.isInteger(r) && Number.isInteger(c)) {
+                        if (!walls.has(key(r, c))) path.add(key(r, c));
+                        renderGrid();
+                    }
+                } else {
+                    // MOVE/REPLAN/TURN/ARRIVE ... -> log only
+                }
+            }
+
+            /* ===== Robust Web Bluetooth (notify+write) ===== */
+            function assignByProps(ch) {
+                const p = ch.properties;
+                if (!rxChar && (p.notify || p.indicate)) rxChar = ch;
+                if (!txChar && (p.writeWithoutResponse || p.write)) txChar = ch; // prefer WNR
+            }
+
+            async function setupUart(service) {
+                rxChar = null;
+                txChar = null;
+                for (const short of CANDIDATE_SHORTS) {
+                    try {
+                        const ch = await service.getCharacteristic(short);
+                        assignByProps(ch);
+                    } catch (_) {}
+                }
+                if (!rxChar || !txChar) {
+                    const list = await service.getCharacteristics();
+                    for (const ch of list) assignByProps(ch);
+                }
+                if (!txChar) throw new Error('No writable characteristic found under FFE0');
+
+                if (rxChar && rxChar.properties.notify) {
+                    await rxChar.startNotifications();
+                    notifyActive = true;
+                    rxChar.addEventListener('characteristicvaluechanged', e => {
+                        const v = new TextDecoder().decode(e.target.value);
+                        bufferFeed(v);
+                    });
+                    log('Notifications started on', rxChar.uuid);
+                } else {
+                    notifyActive = false;
+                    log('No notifiable characteristic found; RX disabled.');
+                }
+            }
+
+            async function connectBle() {
+                setStatus('requesting device...');
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{
+                        services: [UART_SERVICE]
+                    }],
+                    optionalServices: [UART_SERVICE]
+                });
+                device.addEventListener('gattserverdisconnected', onDisc);
+
+                setStatus('connecting...');
+                gatt = await device.gatt.connect();
+
+                setStatus('getting service...');
+                uartSvc = await gatt.getPrimaryService(UART_SERVICE);
+
+                await setupUart(uartSvc);
+                setStatus('connected');
+                startBtn.disabled = !txChar;
+                // log('Connected. RX=', rxChar ? .uuid || '(none)', 'TX=', txChar ? .uuid || '(none)');
+            }
+
+            function onDisc() {
+                setStatus('disconnected');
+                startBtn.disabled = true;
+                log('Disconnected.');
+            }
+
+            /* ==== Send queue, CRLF, chunked, paced, notify-safe ==== */
+            let sendQueue = Promise.resolve();
+
+            function bleWriteLine(line) {
+                sendQueue = sendQueue.then(() => doWrite(line)).catch(() => {});
+                return sendQueue;
+            }
+
+            async function doWrite(line) {
+                if (!txChar) throw new Error('Not connected');
+                const data = new TextEncoder().encode(line + '\r\n'); // CRLF
+                const MTU = 20;
+                try {
+                    for (let i = 0; i < data.length; i += MTU) {
+                        const chunk = data.slice(i, i + MTU);
+                        if (txChar.properties.writeWithoutResponse) await txChar.writeValueWithoutResponse(chunk);
+                        else if (txChar.properties.write) await txChar.writeValue(chunk);
+                        else throw new Error('TX char not writable');
+                        await delay(50);
+                    }
+                } catch (e) {
+                    // retry with notify paused
+                    if (rxChar && notifyActive) {
+                        try {
+                            await rxChar.stopNotifications();
+                            notifyActive = false;
+                            await delay(30);
+                        } catch (_) {}
+                    }
+                    for (let i = 0; i < data.length; i += MTU) {
+                        const chunk = data.slice(i, i + MTU);
+                        if (txChar.properties.writeWithoutResponse) await txChar.writeValueWithoutResponse(chunk);
+                        else if (txChar.properties.write) await txChar.writeValue(chunk);
+                        else throw new Error('TX char not writable');
+                        await delay(60);
+                    }
+                    if (rxChar && rxChar.properties.notify && !notifyActive) {
+                        try {
+                            await rxChar.startNotifications();
+                            notifyActive = true;
+                        } catch (_) {}
+                    }
+                }
+            }
+
+            function delay(ms) {
+                return new Promise(r => setTimeout(r, ms));
+            }
+
+            /* ===== Stream buffer ===== */
+            let rxBuffer = '';
+
+            function bufferFeed(chunk) {
+                rxBuffer += chunk;
+                let i;
+                while ((i = rxBuffer.indexOf('\n')) >= 0) {
+                    const line = rxBuffer.slice(0, i).replace(/\r+$/, '');
+                    rxBuffer = rxBuffer.slice(i + 1);
+                    if (line.trim().length) {
+                        log('RX:', line.trim());
+                        parseLine(line);
+                    }
+                }
+            }
+
+            /* ===== Buttons ===== */
+            document.getElementById('btn').onclick = async() => {
+                try {
+                    await connectBle();
+                } catch (e) {
+                    setStatus('disconnected');
+                    log('Error:', e.message || e);
+                }
+            };
+
+            startBtn.onclick = async() => {
+                try {
+                    await bleWriteLine('1');
+                    log('TX: 1');
+                } catch (e) {
+                    log('Write failed:', e.message || e);
+                }
+            };
+
+            /* ===== Initial render ===== */
+            renderGrid();
+        </script>
+</body>
+
+</html>
